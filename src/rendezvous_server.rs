@@ -17,7 +17,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -32,7 +32,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, secretbox, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -49,11 +49,35 @@ enum Data {
 }
 
 const REG_TIMEOUT: i64 = 30_000;
-type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
+const TCP_READ_TIMEOUT: u64 = 30_000;
+const SECURE_TCP_TIMEOUT: u64 = config::READ_TIMEOUT;
+type RawTcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+
+struct TcpStreamSink {
+    sink: RawTcpStreamSink,
+    encrypt: Option<Encrypt>,
+}
+
+impl TcpStreamSink {
+    async fn send(&mut self, mut bytes: Vec<u8>) -> ResultType<()> {
+        if let Some(encrypt) = self.encrypt.as_mut() {
+            bytes = encrypt.enc(&bytes);
+        }
+        self.sink.send(Bytes::from(bytes)).await?;
+        Ok(())
+    }
+}
+
 enum Sink {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
+}
+
+#[derive(Default)]
+struct TcpNegotiation {
+    first_message: Option<BytesMut>,
+    key: Option<secretbox::Key>,
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -476,6 +500,77 @@ impl RendezvousServer {
         Ok(())
     }
 
+    async fn negotiate_tcp(
+        stream: &mut Framed<TcpStream, BytesCodec>,
+        addr: SocketAddr,
+        signing_key: Option<&sign::SecretKey>,
+        handshake_timeout: u64,
+    ) -> ResultType<TcpNegotiation> {
+        let Some(signing_key) = signing_key else {
+            return Ok(TcpNegotiation::default());
+        };
+
+        let (ephemeral_pk, ephemeral_sk) = box_::gen_keypair();
+        let mut offer = RendezvousMessage::new();
+        offer.set_key_exchange(KeyExchange {
+            keys: vec![sign::sign(&ephemeral_pk.0, signing_key).into()],
+            ..Default::default()
+        });
+        let offer = Bytes::from(offer.write_to_bytes()?);
+        match timeout(handshake_timeout, stream.send(offer)).await {
+            Ok(result) => result?,
+            Err(_) => bail!("Secure TCP handshake offer timed out"),
+        }
+
+        let bytes = match timeout(handshake_timeout, stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(err))) => return Err(err.into()),
+            Ok(None) => bail!("Secure TCP peer closed during handshake"),
+            Err(_) => bail!("Secure TCP handshake response timed out"),
+        };
+        let message = match RendezvousMessage::parse_from_bytes(&bytes) {
+            Ok(message) => message,
+            Err(_) => bail!("Secure TCP handshake received malformed protobuf"),
+        };
+        match message.union {
+            Some(rendezvous_message::Union::KeyExchange(exchange)) => {
+                if exchange.keys.len() != 2 {
+                    bail!("Secure TCP handshake has invalid key cardinality");
+                }
+                if exchange.keys[0].len() != box_::PUBLICKEYBYTES {
+                    bail!("Secure TCP handshake has invalid public key length");
+                }
+                if exchange.keys[1].len() != secretbox::KEYBYTES + box_::MACBYTES {
+                    bail!("Secure TCP handshake has invalid encrypted key length");
+                }
+                let key = Encrypt::decode(&exchange.keys[1], &exchange.keys[0], &ephemeral_sk)?;
+                log::info!("Secure TCP handshake succeeded: peer={addr}");
+                Ok(TcpNegotiation {
+                    first_message: None,
+                    key: Some(key),
+                })
+            }
+            Some(_) => Ok(TcpNegotiation {
+                first_message: Some(bytes),
+                key: None,
+            }),
+            None => bail!("Secure TCP handshake received an empty message"),
+        }
+    }
+
+    async fn send_tcp_message(
+        stream: &mut Framed<TcpStream, BytesCodec>,
+        encrypt: &mut Option<Encrypt>,
+        message: &RendezvousMessage,
+    ) -> ResultType<()> {
+        let mut bytes = message.write_to_bytes()?;
+        if let Some(encrypt) = encrypt.as_mut() {
+            bytes = encrypt.enc(&bytes);
+        }
+        stream.send(Bytes::from(bytes)).await?;
+        Ok(())
+    }
+
     #[inline]
     async fn handle_tcp(
         &mut self,
@@ -484,10 +579,15 @@ impl RendezvousServer {
         addr: SocketAddr,
         key: &str,
         ws: bool,
+        secured: bool,
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
+                    if !ws && !secured && !ph.token.is_empty() {
+                        log::warn!("Rejected plaintext TCP request with access token: peer={addr}");
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -496,6 +596,10 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    if !ws && !secured && !rf.token.is_empty() {
+                        log::warn!("Rejected plaintext TCP request with access token: peer={addr}");
+                        return false;
+                    }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
@@ -581,6 +685,9 @@ impl RendezvousServer {
                         ..Default::default()
                     });
                     Self::send_to_sink(sink, msg_out).await;
+                }
+                Some(rendezvous_message::Union::KeyExchange(_)) => {
+                    log::warn!("Rejected unexpected Secure TCP key exchange: peer={addr}");
                 }
                 _ => {}
             }
@@ -832,11 +939,7 @@ impl RendezvousServer {
     }
 
     #[inline]
-    async fn handle_online_request(
-        &mut self,
-        stream: &mut FramedStream,
-        peers: Vec<String>,
-    ) -> ResultType<()> {
+    async fn create_online_response(&mut self, peers: Vec<String>) -> RendezvousMessage {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
@@ -855,9 +958,7 @@ impl RendezvousServer {
             states: states.into(),
             ..Default::default()
         });
-        stream.send(&msg_out).await?;
-
-        Ok(())
+        msg_out
     }
 
     #[inline]
@@ -874,7 +975,7 @@ impl RendezvousServer {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
                     Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
+                        allow_err!(s.send(bytes).await);
                     }
                     Sink::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
@@ -1151,34 +1252,66 @@ impl RendezvousServer {
                 if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                     if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                         let res = rs.check_cmd(data).await;
-                        stream.write(res.as_bytes()).await.ok();
+                        stream.write_all(res.as_bytes()).await.ok();
                     }
                 }
             });
             return;
         }
-        let stream = FramedStream::from(stream, addr);
         tokio::spawn(async move {
-            let mut stream = stream;
-            if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
-                if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-                    match msg_in.union {
-                        Some(rendezvous_message::Union::TestNatRequest(_)) => {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_test_nat_response(TestNatResponse {
-                                port: addr.port() as _,
-                                ..Default::default()
-                            });
-                            stream.send(&msg_out).await.ok();
-                        }
-                        Some(rendezvous_message::Union::OnlineRequest(or)) => {
-                            allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            allow_err!(
+                rs.handle_listener2_inner(stream, addr, SECURE_TCP_TIMEOUT)
+                    .await
+            );
         });
+    }
+
+    async fn handle_listener2_inner(
+        &mut self,
+        stream: TcpStream,
+        addr: SocketAddr,
+        handshake_timeout: u64,
+    ) -> ResultType<()> {
+        let mut stream = Framed::new(stream, BytesCodec::new());
+        let mut negotiation =
+            Self::negotiate_tcp(&mut stream, addr, self.inner.sk.as_ref(), handshake_timeout)
+                .await?;
+        let mut encrypt = negotiation.key.take().map(Encrypt::new);
+        let mut bytes = if let Some(bytes) = negotiation.first_message.take() {
+            bytes
+        } else {
+            match timeout(TCP_READ_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(bytes))) => bytes,
+                Ok(Some(Err(err))) => return Err(err.into()),
+                Ok(None) => return Ok(()),
+                Err(_) => bail!("TCP request timed out"),
+            }
+        };
+        if let Some(encrypt) = encrypt.as_mut() {
+            encrypt.dec(&mut bytes)?;
+        }
+        let message = match RendezvousMessage::parse_from_bytes(&bytes) {
+            Ok(message) => message,
+            Err(_) => bail!("TCP request contained malformed protobuf"),
+        };
+        let response = match message.union {
+            Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                let mut response = RendezvousMessage::new();
+                response.set_test_nat_response(TestNatResponse {
+                    port: addr.port() as _,
+                    ..Default::default()
+                });
+                response
+            }
+            Some(rendezvous_message::Union::OnlineRequest(request)) => {
+                self.create_online_response(request.peers).await
+            }
+            Some(rendezvous_message::Union::KeyExchange(_)) => {
+                bail!("Unexpected Secure TCP key exchange")
+            }
+            _ => return Ok(()),
+        };
+        Self::send_tcp_message(&mut stream, &mut encrypt, &response).await
     }
 
     async fn handle_listener(&self, stream: TcpStream, addr: SocketAddr, key: &str, ws: bool) {
@@ -1221,16 +1354,49 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self
+                        .handle_tcp(&bytes, &mut sink, addr, key, ws, false)
+                        .await
+                    {
                         break;
                     }
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+            let mut framed = Framed::new(stream, BytesCodec::new());
+            let mut negotiation = Self::negotiate_tcp(
+                &mut framed,
+                addr,
+                self.inner.sk.as_ref(),
+                SECURE_TCP_TIMEOUT,
+            )
+            .await?;
+            let secured = negotiation.key.is_some();
+            let mut decrypt = negotiation.key.clone().map(Encrypt::new);
+            let (a, mut b) = framed.split();
+            sink = Some(Sink::TcpStream(TcpStreamSink {
+                sink: a,
+                encrypt: negotiation.key.take().map(Encrypt::new),
+            }));
+            loop {
+                let mut bytes = if let Some(bytes) = negotiation.first_message.take() {
+                    bytes
+                } else {
+                    match timeout(TCP_READ_TIMEOUT, b.next()).await {
+                        Ok(Some(Ok(bytes))) => bytes,
+                        _ => break,
+                    }
+                };
+                if let Some(decrypt) = decrypt.as_mut() {
+                    if decrypt.dec(&mut bytes).is_err() {
+                        log::warn!("Secure TCP frame authentication failed: peer={addr}");
+                        break;
+                    }
+                }
+                if !self
+                    .handle_tcp(&bytes, &mut sink, addr, key, ws, secured)
+                    .await
+                {
                     break;
                 }
             }
@@ -1411,3 +1577,6 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
 }
+
+#[cfg(test)]
+mod tests;

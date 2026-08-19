@@ -130,6 +130,18 @@ impl PolicyClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(mode: PolicyMode, endpoint: String, timeout: Duration) -> Self {
+        Self {
+            mode,
+            endpoint,
+            service_token: "test-service-token".to_owned(),
+            instance_id: "test-hbbs".to_owned(),
+            timeout,
+            client: reqwest::Client::builder().timeout(timeout).build().unwrap(),
+        }
+    }
+
     pub async fn authorize(&self, mut request: AuthorizationRequest) -> bool {
         if self.mode == PolicyMode::Off {
             return true;

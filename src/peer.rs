@@ -89,6 +89,14 @@ impl PeerMap {
         Ok(pm)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn for_test(url: &str) -> ResultType<Self> {
+        Ok(Self {
+            map: Default::default(),
+            db: database::Database::new(url).await?,
+        })
+    }
+
     #[inline]
     pub(crate) async fn update_pk(
         &mut self,
