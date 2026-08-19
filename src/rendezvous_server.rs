@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::policy_client::{connection_type, request as policy_request, PolicyClient};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -77,6 +78,7 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    policy: PolicyClient,
 }
 
 #[derive(Clone)]
@@ -104,6 +106,8 @@ impl RendezvousServer {
         let nat_port = port - 1;
         let ws_port = port + 2;
         let pm = PeerMap::new().await?;
+        let policy = PolicyClient::from_env()?;
+        policy.log_configuration();
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
         log::info!("Listening on tcp/udp :{}", port);
@@ -141,6 +145,7 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                policy,
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -495,6 +500,29 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
+                    if !self
+                        .inner
+                        .policy
+                        .authorize(policy_request(
+                            "relay",
+                            rf.token.clone(),
+                            rf.uuid.clone(),
+                            addr.ip().to_string(),
+                            rf.id.clone(),
+                            connection_type(rf.conn_type.value()),
+                            true,
+                        ))
+                        .await
+                    {
+                        let mut denied = RendezvousMessage::new();
+                        denied.set_relay_response(RelayResponse {
+                            uuid: rf.uuid,
+                            refuse_reason: "access_denied".to_owned(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(denied, addr).await);
+                        return true;
+                    }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
@@ -684,6 +712,28 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if !self
+            .inner
+            .policy
+            .authorize(policy_request(
+                "punch_hole",
+                ph.token.clone(),
+                String::new(),
+                addr.ip().to_string(),
+                ph.id.clone(),
+                connection_type(ph.conn_type.value()),
+                false,
+            ))
+            .await
+        {
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
+                other_failure: "access_denied".to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
