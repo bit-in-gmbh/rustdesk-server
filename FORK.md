@@ -1,12 +1,12 @@
 # RustDesk Server Fork
 
-Basis: RustDesk Server OSS `1.1.16`, Commit `73523b31cfd25d77dee862e6fc9f5e1fb5e485ef`.
+Based on RustDesk Server OSS `1.1.16`, commit `73523b31cfd25d77dee862e6fc9f5e1fb5e485ef`.
 
 ## Management Policy Hook
 
-`hbbs` ruft die Management-Policy für TCP-`PunchHoleRequest` und `RequestRelay` auf. Der Access-Token, die Ziel-ID, der Connection-Type, die Quell-IP und bei Relay-Anfragen die Request-UUID werden an den Policy-Endpunkt übermittelt.
+`hbbs` invokes the management policy for TCP `PunchHoleRequest` and `RequestRelay` requests. The access token, target ID, connection type, source IP, and, for relay requests, the request UUID are sent to the policy endpoint.
 
-Konfiguration:
+Configuration:
 
 ```text
 POLICY_MODE=off|observe|enforce
@@ -16,28 +16,28 @@ POLICY_TIMEOUT_MS=300
 POLICY_INSTANCE_ID=hbbs-1
 ```
 
-`observe` lässt abgelehnte oder fehlgeschlagene Prüfungen zu. `enforce` lehnt Deny-Antworten, Timeouts, Verbindungsfehler, HTTP-Fehler und ungültige Antworten ab. Es gibt keinen Retry und keinen Decision Cache.
+`observe` permits denied or failed checks. `enforce` rejects deny responses, timeouts, connection failures, HTTP errors, and invalid responses. There are no retries and no decision cache.
 
-RustDesk Client `1.4.6`, Tag-Commit `1abc897c451c8b5bbff3792509a7fef9d12f2ce3`, setzt bei `PunchHoleRequest` den Account-Access-Token, die Ziel-ID und den Connection-Type. `RequestRelay.uuid` ist die Relay-Request-ID. Ein nicht gesetzter Relay-Connection-Type wird als `remote_desktop` verarbeitet.
+RustDesk Client `1.4.6`, tag commit `1abc897c451c8b5bbff3792509a7fef9d12f2ce3`, sets the account access token, target ID, and connection type in `PunchHoleRequest`. `RequestRelay.uuid` is the relay request ID. An unset relay connection type is handled as `remote_desktop`.
 
 ## Secure TCP
 
-`hbbs` bietet den RustDesk-`KeyExchange` auf protobuf-gerahmten TCP-Verbindungen an:
+`hbbs` supports the RustDesk `KeyExchange` on protobuf-framed TCP connections:
 
-- Port `21115/TCP`: optionale Aushandlung für NAT-Test und Online-Abfragen. RustDesk Client `1.4.6` verwendet hier weiterhin den kompatiblen Klartextpfad.
-- Port `21116/TCP`: Aushandlung für Rendezvous-Verbindungen einschließlich `PunchHoleRequest` und `RequestRelay`.
-- Port `21116/UDP`: keine Aushandlung.
-- WebSocket-Port `21118/TCP`: keine Secure-TCP-Aushandlung; **Use WebSocket** bleibt für diesen Fork deaktiviert.
-- Der lokale Textbefehlspfad auf `21115/TCP` bleibt unverändert.
+- Port `21115/TCP`: optional negotiation for NAT testing and online queries. RustDesk Client `1.4.6` continues to use the compatible plaintext path here.
+- Port `21116/TCP`: negotiation for rendezvous connections, including `PunchHoleRequest` and `RequestRelay`.
+- Port `21116/UDP`: no negotiation.
+- WebSocket port `21118/TCP`: no Secure TCP negotiation; **Use WebSocket** remains disabled for this fork.
+- The local text-command path on `21115/TCP` remains unchanged.
 
-Jede Verbindung verwendet ein neues ephemeres `box_`-Schlüsselpaar. Der Server signiert den ephemeren Public Key mit seinem persistenten Ed25519-Schlüssel. Der Client antwortet mit seinem ephemeren Public Key und dem authentisiert verschlüsselten `secretbox`-Schlüssel. Der Handshake verwendet die Protobuf-Cardinalität, den Null-Nonce für `box_` und die getrennten, bei `1` beginnenden Richtungszähler von RustDesk Client `1.4.6`. Das Handshake-Limit beträgt `18` Sekunden.
+Each connection uses a new ephemeral `box_` key pair. The server signs the ephemeral public key with its persistent Ed25519 key. The client responds with its ephemeral public key and the authenticated, encrypted `secretbox` key. The handshake uses the protobuf cardinality, the zero nonce for `box_`, and RustDesk Client `1.4.6`'s separate, direction-specific counters starting at `1`. The handshake timeout is `18` seconds.
 
-Eine zuerst empfangene normale Nachricht legt die Verbindung auf den kompatiblen Klartextpfad fest. Tokenlose OSS-Anfragen bleiben unterstützt. Eine Klartextanfrage auf `21116/TCP` mit Account-Access-Token wird vor dem Policy-Aufruf geschlossen. Nach einem begonnenen oder fehlgeschlagenen `KeyExchange` gibt es keinen Klartext-Fallback.
+A normal message received first commits the connection to the compatible plaintext path. Tokenless OSS requests remain supported. A plaintext request on `21116/TCP` with an account access token is closed before invoking the policy. There is no plaintext fallback after a `KeyExchange` has started or failed.
 
-Private Schlüssel, symmetrische Schlüssel, Access-Tokens, Licence-Keys, verschlüsselte Payloads und Authorization-Header werden nicht geloggt.
+Private keys, symmetric keys, access tokens, license keys, encrypted payloads, and authorization headers are not logged.
 
-## Binaries und Lizenz
+## Binaries and License
 
-Das angepasste Binary ist `hbbs`. `hbbr` bleibt das unveränderte Upstream-Binary und wird im Deployment aus dem offiziellen Image gestartet.
+The modified binary is `hbbs`. `hbbr` remains the unmodified upstream binary and is started in deployment from the official image.
 
-Der Fork bleibt AGPL-3.0. Lizenztext, Fork-Historie, Submodul-Pin und korrespondierender Quellcode werden bei Verteilung mitgeliefert.
+The fork remains AGPL-3.0 licensed. The license text, fork history, submodule pin, and corresponding source code are included with distribution.
