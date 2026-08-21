@@ -3,4 +3,5 @@ pub use rendezvous_server::*;
 pub mod common;
 mod database;
 mod peer;
+pub mod policy_client;
 mod version;

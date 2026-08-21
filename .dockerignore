@@ -1,0 +1,9 @@
+.git
+.github
+target
+ui
+docker
+docker-classic
+kubernetes
+systemd
+debian

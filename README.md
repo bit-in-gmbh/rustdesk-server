@@ -1,3 +1,7 @@
+# This Fork
+
+Changes from upstream are [documented in FORK.md](FORK.md).
+
 # RustDesk Server Program
 
 [![build](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml/badge.svg)](https://github.com/rustdesk/rustdesk-server/actions/workflows/build.yaml)
