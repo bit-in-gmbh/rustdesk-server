@@ -1,6 +1,6 @@
 # This Fork
 
-Changes from upstream are [documented in FORK.md](FORK.md).
+Changes from upstream are [documented in FORK-CHANGELOG.md](FORK-CHANGELOG.md).
 
 # RustDesk Server Program
 
@@ -45,14 +45,14 @@ the available flags.
 
 The most common options:
 
-| Option | Flag | Env var | Applies to | Purpose |
-| --- | --- | --- | --- | --- |
-| Key | `-k` | `KEY` | hbbs, hbbr | `hbbs` loads/generates one by default |
-| Bind address | `-b` | `BIND` | hbbs, hbbr | Local IP address to listen on (default: all interfaces; requires 1.1.17+) |
-| Port | `-p` | `PORT` | hbbs, hbbr | Listening port (hbbs `21116`, hbbr `21117`) |
-| Relay servers | `-r` | `RELAY-SERVERS` | hbbs | Override when the relay uses a different address or a non-standard port |
-| Force relay | — | `ALWAYS_USE_RELAY` | hbbs | `Y` disables direct connections |
-| Log level | — | `RUST_LOG` | hbbs, hbbr | e.g. `debug` (default `info`) |
+| Option        | Flag | Env var            | Applies to | Purpose                                                                   |
+| ------------- | ---- | ------------------ | ---------- | ------------------------------------------------------------------------- |
+| Key           | `-k` | `KEY`              | hbbs, hbbr | `hbbs` loads/generates one by default                                     |
+| Bind address  | `-b` | `BIND`             | hbbs, hbbr | Local IP address to listen on (default: all interfaces; requires 1.1.17+) |
+| Port          | `-p` | `PORT`             | hbbs, hbbr | Listening port (hbbs `21116`, hbbr `21117`)                               |
+| Relay servers | `-r` | `RELAY-SERVERS`    | hbbs       | Override when the relay uses a different address or a non-standard port   |
+| Force relay   | —    | `ALWAYS_USE_RELAY` | hbbs       | `Y` disables direct connections                                           |
+| Log level     | —    | `RUST_LOG`         | hbbs, hbbr | e.g. `debug` (default `info`)                                             |
 
 See **[docs/environment-variables.md](docs/environment-variables.md)** for the
 full list of variables, the file/flag/env precedence rules, database and relay
